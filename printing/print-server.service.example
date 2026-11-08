@@ -1,0 +1,12 @@
+[Unit]
+Description=Google PDF Print Server
+After=network.target
+
+[Service]
+WorkingDirectory=/home/aschool
+EnvironmentFile=/home/aschool/print-server.env.local
+ExecStart=/home/aschool/venv/bin/python /home/aschool/printServer.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

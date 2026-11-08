@@ -1,0 +1,27 @@
+# Local credentials and state
+.env
+.env.*
+!*.env.example
+*.local
+*.local.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials.json
+token.json
+secrets/
+state/
+.clasp.json
+.clasprc.json
+**/.clasprc.json
+**/.clasp.json
+__pycache__/
+*.pyc
+*.log
+*.db
+*.sqlite*
+.venv/
+venv/
+node_modules/
+.DS_Store

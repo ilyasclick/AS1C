@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+import fcntl
+import hashlib
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+BASE = Path(os.environ["AS1C_GUARD_BASE"])
+SNAP = BASE / "bound-school-baseline-20261106"
+STAGE = BASE / "bound-school-stage"
+LOCK = BASE / ".as1c-bound.lock"
+AUTH = Path(os.environ["AS1C_OAUTH_FILE"])
+CLASP = os.environ["AS1C_CLASP_COMMAND"]
+ID = os.environ["AS1C_BOUND_SCRIPT_ID"]
+ALIAS = os.environ["AS1C_SCHOOL_ALIAS"]
+EMAIL = os.environ["AS1C_SCHOOL_EMAIL"]
+ARGS = [CLASP, "--auth", str(AUTH), "--user", ALIAS]
+
+def stop(message):
+    raise SystemExit("DENIED: " + message)
+
+def safe_dir(path):
+    if path.is_symlink() or not path.is_dir():
+        stop("missing or linked directory")
+    stat = path.stat()
+    if stat.st_uid != os.geteuid() or stat.st_mode & 0o077:
+        stop("directory permissions invalid")
+
+def safe_file(path):
+    if path.is_symlink() or not path.is_file():
+        stop("missing or linked file")
+    stat = path.stat()
+    if stat.st_uid != os.geteuid() or stat.st_mode & 0o077:
+        stop("file permissions invalid")
+
+def inventory(root):
+    safe_dir(root)
+    found = {}
+    for path in root.rglob("*"):
+        if path.is_symlink():
+            stop("linked content forbidden")
+        if path.is_file():
+            safe_file(path)
+            found[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+    expected_id = json.loads((root / ".clasp.json").read_text())
+    if expected_id.get("scriptId") != ID or expected_id.get("rootDir", "") != "":
+        stop("project identity differs")
+    return found
+
+def digest(files):
+    return hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+def identity():
+    if pwd.getpwuid(os.geteuid()).pw_name != "ilyas":
+        stop("Linux account differs")
+    for path in (BASE.parent, BASE, SNAP, AUTH.parent):
+        safe_dir(path)
+    safe_file(AUTH)
+    result = subprocess.run(ARGS + ["--json", "show-authorized-user"],
+                            cwd=BASE, capture_output=True, text=True, timeout=40)
+    if result.returncode:
+        stop("OAuth validation failed")
+    profile = json.loads(result.stdout)
+    if not profile.get("loggedIn") or profile.get("email", "").lower() != EMAIL:
+        stop("wrong Google identity")
+
+def remote_inventory():
+    with tempfile.TemporaryDirectory(prefix=".as1c-pull-", dir=BASE) as folder:
+        root = Path(folder)
+        shutil.copy2(SNAP / ".clasp.json", root / ".clasp.json")
+        subprocess.run(ARGS + ["pull"], cwd=root, check=True, stdout=subprocess.DEVNULL, timeout=90)
+        return inventory(root)
+
+def validate_candidate():
+    base = inventory(SNAP)
+    stage = inventory(STAGE)
+    if set(base) != set(stage):
+        stop("added or removed files require a separate reviewed migration")
+    if base[".clasp.json"] != stage[".clasp.json"]:
+        stop("project config changed")
+    if base["appsscript.json"] != stage["appsscript.json"]:
+        stop("manifest edits require separate review")
+    changed = sorted(name for name in base if base[name] != stage[name])
+    if any(not name.endswith((".js", ".html")) for name in changed):
+        stop("non-source files changed")
+    if not changed:
+        stop("no staged source changes")
+    return base, stage, changed
+
+def preflight():
+    base, stage, changed = validate_candidate()
+    if remote_inventory() != base:
+        stop("remote differs from recorded baseline; stop and reconcile")
+    return stage, changed
+
+def main():
+    os.umask(0o077)
+    if len(sys.argv) < 2 or sys.argv[1] not in ("verify", "init-stage", "prepare", "publish"):
+        stop("usage: as1c-bound-guard verify|init-stage|prepare|publish <digest>")
+    action = sys.argv[1]
+    with LOCK.open("a+") as handle:
+        os.chmod(LOCK, 0o600)
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        identity()
+        base = inventory(SNAP)
+        if action == "verify":
+            if len(sys.argv) != 2:
+                stop("unexpected arguments")
+            if remote_inventory() != base:
+                stop("remote differs from recorded baseline")
+            print("VERIFIED_READ " + EMAIL + " BASELINE " + digest(base))
+        elif action == "init-stage":
+            if len(sys.argv) != 2 or STAGE.exists():
+                stop("stage exists or arguments invalid")
+            if remote_inventory() != base:
+                stop("remote differs from recorded baseline")
+            shutil.copytree(SNAP, STAGE)
+            safe_dir(STAGE)
+            print("STAGE_READY " + str(STAGE))
+        elif action == "prepare":
+            if len(sys.argv) != 2:
+                stop("unexpected arguments")
+            stage, changed = preflight()
+            print("PREPARED_DIGEST=" + digest(stage))
+            print("CHANGED_FILES=" + ",".join(changed))
+            print("PUSH_PENDING_USER_APPROVAL")
+        else:
+            if len(sys.argv) != 4 or sys.argv[3] != "--approved":
+                stop("explicit approved digest required")
+            stage, changed = preflight()
+            if sys.argv[2] != digest(stage):
+                stop("staged digest differs from reviewed digest")
+            print("PUSH_BEGIN " + ",".join(changed), flush=True)
+            subprocess.run(ARGS + ["push"], cwd=STAGE, check=True, timeout=120)
+            cloud = remote_inventory()
+            if cloud != stage:
+                stop("post-push verification failed; backup retained")
+            archive = BASE / ("bound-school-after-" + digest(stage)[:12])
+            if archive.exists():
+                stop("post-push archive already exists")
+            shutil.copytree(STAGE, archive)
+            print("PUSH_VERIFIED " + digest(stage))
+            print("BACKUP_RETAINED " + str(SNAP))
+            print("AFTER_SNAPSHOT " + str(archive))
+
+if __name__ == "__main__":
+    main()

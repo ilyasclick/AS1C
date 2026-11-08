@@ -1,0 +1,57 @@
+#!/usr/bin/env python3
+import os
+import pwd
+import socket
+import sys
+from pathlib import Path
+
+USERNAME = os.environ["AS1C_OS_USER"]
+AUTH = Path(os.environ["AS1C_OAUTH_FILE"])
+WORKSPACE = Path(os.environ["AS1C_AVT2_WORKSPACE"])
+SHIM = Path(os.environ["AS1C_LOGIN_SHIM"])
+CLASP = os.environ["AS1C_CLASP_COMMAND"]
+PORT = 8888
+
+def deny(reason):
+    print("DENIED: " + reason, file=sys.stderr)
+    raise SystemExit(1)
+
+if pwd.getpwuid(os.geteuid()).pw_name != USERNAME:
+    deny("unexpected Linux owner")
+if not sys.stdin.isatty() or not sys.stdout.isatty():
+    deny("personal interactive SSH terminal required")
+if len(sys.argv) != 1:
+    deny("no arguments allowed")
+
+for item in (WORKSPACE, AUTH.parent):
+    if item.is_symlink() or not item.is_dir():
+        deny("invalid protected directory")
+    info = item.stat()
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        deny("unsafe directory permissions")
+if not SHIM.is_file() or SHIM.is_symlink():
+    deny("callback binding shim missing")
+shim_mode = SHIM.stat()
+if shim_mode.st_uid != os.geteuid() or shim_mode.st_mode & 0o077:
+    deny("unsafe callback shim permissions")
+if AUTH.is_symlink():
+    deny("credential symlink")
+if AUTH.exists():
+    mode = AUTH.stat()
+    if mode.st_uid != os.geteuid() or mode.st_mode & 0o077:
+        deny("unsafe credential file permissions")
+
+with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as check:
+    try:
+        check.bind(("127.0.0.1", PORT))
+    except OSError:
+        deny("local callback port is in use")
+
+env = os.environ.copy()
+env["NODE_OPTIONS"] = "--require=" + str(SHIM)
+os.umask(0o077)
+os.chdir(WORKSPACE)
+print("Use only demo@example.invalid; do not share OAuth callback links or codes.")
+sys.stdout.flush()
+os.execve(CLASP, [CLASP, "--auth", str(AUTH), "--user", "avtoshkola",
+                  "login", "--redirect-port", str(PORT)], env)
